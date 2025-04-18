@@ -25,6 +25,7 @@ if (!fs.existsSync(BIN_DIR)) {
 
 // Path for yt-dlp binary
 const ytdlpPath = path.join(BIN_DIR, process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
+const cookiesPath = path.resolve('./youtube_cookies.txt')
 
 // Create a config directory for yt-dlp
 const configDir = path.join(os.tmpdir(), 'yt-dlp-config');
@@ -97,33 +98,28 @@ initializeYtDlp()
 async function extractAudio(videoId) {
   const url = `https://www.youtube.com/watch?v=${videoId}`;
   const outputPath = path.join(os.tmpdir(), `${videoId}.mp3`);
-  
-  // Remove existing file if it exists
-  if (fs.existsSync(outputPath)) {
-    fs.unlinkSync(outputPath);
-  }
+  const cookiesPath = path.resolve('./youtube_cookies.txt'); // Put your cookies file in the project root
 
-  try {
-    // Use the yt-dlp command directly with all the necessary options
-    const command = `"${ytdlpPath}" "${url}" --config-location "${configPath}" -f "bestaudio" -x --audio-format mp3 --audio-quality 0 -o "${outputPath}"`;
-    
-    console.log(`Executing command: ${command}`);
-    await execPromise(command);
-    
-    // Read the file and return as buffer
-    if (fs.existsSync(outputPath)) {
-      const buffer = fs.readFileSync(outputPath);
-      // Clean up file after reading
-      fs.unlinkSync(outputPath);
-      return buffer;
-    } else {
-      throw new Error('Output file not created');
+  if (!fs.existsSync(outputPath)) {
+    try {
+      const command = `"${ytdlpPath}" "${url}" --cookies "${cookiesPath}" --config-location "${configPath}" -f "bestaudio" -x --audio-format mp3 --audio-quality 0 -o "${outputPath}"`;
+      console.log(`Executing command: ${command}`);
+      await execPromise(command);
+
+      if (fs.existsSync(outputPath)) {
+        const buffer = fs.readFileSync(outputPath);
+        fs.unlinkSync(outputPath);
+        return buffer;
+      } else {
+        throw new Error('Output file not created');
+      }
+    } catch (error) {
+      console.error('Error extracting audio with command:', error);
+      throw error;
     }
-  } catch (error) {
-    console.error('Error extracting audio with command:', error);
-    throw error;
   }
 }
+
 
 // Define routes and start server
 function startServer() {

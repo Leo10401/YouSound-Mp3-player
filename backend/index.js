@@ -7,6 +7,7 @@ import path from 'path';
 import fs from 'fs';
 import { exec } from 'child_process';
 import { promisify } from 'util';
+import os from 'os';
 
 dotenv.config();
 const execPromise = promisify(exec);
@@ -25,14 +26,31 @@ if (!fs.existsSync(BIN_DIR)) {
 // Path for yt-dlp binary
 const ytdlpPath = path.join(BIN_DIR, process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
 
+// Create a config directory for yt-dlp
+const configDir = path.join(os.tmpdir(), 'yt-dlp-config');
+if (!fs.existsSync(configDir)) {
+  fs.mkdirSync(configDir, { recursive: true });
+}
+
+// Create a yt-dlp config file with increased rate limit and additional options
+const configPath = path.join(configDir, 'config');
+const configContent = `
+--geo-bypass
+--no-check-certificate
+--extractor-args "youtube:player_client=android,web"
+--user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36"
+--add-header "Accept-Language:en-US,en;q=0.9"
+--ignore-errors
+--no-warnings
+--no-progress
+`;
+
+fs.writeFileSync(configPath, configContent);
+
 // Download and initialize yt-dlp
 async function initializeYtDlp() {
   if (!fs.existsSync(ytdlpPath)) {
     console.log('yt-dlp binary not found. Downloading...');
-    
-    // Get the appropriate download URL based on platform
-    const platform = process.platform === 'win32' ? 'win_exe' : 
-                      process.platform === 'darwin' ? 'macos' : 'linux';
     
     // Latest stable version URL
     const ytdlpUrl = process.platform === 'win32' 
@@ -57,8 +75,10 @@ async function initializeYtDlp() {
     console.log('yt-dlp binary already exists');
   }
   
-  // Return initialized YtDlp instance
-  return new YtDlp({ binaryPath: ytdlpPath });
+  // Return initialized YtDlp instance with config path
+  return new YtDlp({ 
+    binaryPath: ytdlpPath
+  });
 }
 
 // Initialize server only after yt-dlp is ready
@@ -73,26 +93,66 @@ initializeYtDlp()
     process.exit(1);
   });
 
+// Helper function to extract audio using raw command
+async function extractAudio(videoId) {
+  const url = `https://www.youtube.com/watch?v=${videoId}`;
+  const outputPath = path.join(os.tmpdir(), `${videoId}.mp3`);
+  
+  // Remove existing file if it exists
+  if (fs.existsSync(outputPath)) {
+    fs.unlinkSync(outputPath);
+  }
+
+  try {
+    // Use the yt-dlp command directly with all the necessary options
+    const command = `"${ytdlpPath}" "${url}" --config-location "${configPath}" -f "bestaudio" -x --audio-format mp3 --audio-quality 0 -o "${outputPath}"`;
+    
+    console.log(`Executing command: ${command}`);
+    await execPromise(command);
+    
+    // Read the file and return as buffer
+    if (fs.existsSync(outputPath)) {
+      const buffer = fs.readFileSync(outputPath);
+      // Clean up file after reading
+      fs.unlinkSync(outputPath);
+      return buffer;
+    } else {
+      throw new Error('Output file not created');
+    }
+  } catch (error) {
+    console.error('Error extracting audio with command:', error);
+    throw error;
+  }
+}
+
 // Define routes and start server
 function startServer() {
   app.get('/audio/:videoId', async (req, res) => {
     const { videoId } = req.params;
-    const url = `https://www.youtube.com/watch?v=${videoId}`;
-
+    
     try {
       let buffer = audioCache.get(videoId);
 
       if (!buffer) {
-        const file = await ytDlp.getFileAsync(url, {
-          format: {
-            filter: 'audioonly',
-            type: 'mp3',
-            quality: 'highest',
-          },
-          filename: `${videoId}.mp3`,
-        });
-
-        buffer = Buffer.from(await file.arrayBuffer());
+        try {
+          // First try with the YtDlp class
+          console.log(`Fetching audio for video ID: ${videoId}`);
+          const file = await ytDlp.getFileAsync(`https://www.youtube.com/watch?v=${videoId}`, {
+            format: {
+              filter: 'audioonly',
+              type: 'mp3',
+              quality: 'highest',
+            },
+            filename: `${videoId}.mp3`,
+          });
+          buffer = Buffer.from(await file.arrayBuffer());
+        } catch (classError) {
+          console.warn('YtDlp class method failed, falling back to command:', classError.message);
+          // Fallback to our command-line extraction method
+          buffer = await extractAudio(videoId);
+        }
+        
+        // Cache the result
         audioCache.set(videoId, buffer);
       }
 
@@ -123,7 +183,7 @@ function startServer() {
       }
     } catch (err) {
       console.error('Audio fetch error:', err);
-      res.status(500).send('Failed to load audio.');
+      res.status(500).send('Failed to load audio: ' + err.message);
     }
   });
 

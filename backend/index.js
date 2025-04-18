@@ -8,6 +8,7 @@ import fs from 'fs';
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import os from 'os';
+import rateLimit from 'express-rate-limit';
 
 dotenv.config();
 const execPromise = promisify(exec);
@@ -16,7 +17,15 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const audioCache = new NodeCache({ stdTTL: 3600 }); // 1 hour cache
 
+// Rate limiter to avoid excessive YouTube requests
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 30, // limit each IP to 30 requests per windowMs
+  message: 'Too many requests, please try again later'
+});
+
 app.use(cors());
+app.use('/audio', apiLimiter);
 
 // First, ensure binary directory exists
 if (!fs.existsSync(BIN_DIR)) {
@@ -25,7 +34,7 @@ if (!fs.existsSync(BIN_DIR)) {
 
 // Path for yt-dlp binary
 const ytdlpPath = path.join(BIN_DIR, process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
-const cookiesPath = path.resolve('./youtube_cookies.txt')
+const cookiesPath = path.join(os.tmpdir(), 'youtube_cookies.txt');
 
 // Create a config directory for yt-dlp
 const configDir = path.join(os.tmpdir(), 'yt-dlp-config');
@@ -47,6 +56,17 @@ const configContent = `
 `;
 
 fs.writeFileSync(configPath, configContent);
+
+// Load YouTube cookies from environment variable if available
+if (process.env.YOUTUBE_COOKIES_BASE64) {
+  try {
+    const cookiesContent = Buffer.from(process.env.YOUTUBE_COOKIES_BASE64, 'base64').toString();
+    fs.writeFileSync(cookiesPath, cookiesContent);
+    console.log('YouTube cookies file created from environment variable');
+  } catch (error) {
+    console.error('Failed to create cookies file from environment variable:', error);
+  }
+}
 
 // Download and initialize yt-dlp
 async function initializeYtDlp() {
@@ -82,6 +102,119 @@ async function initializeYtDlp() {
   });
 }
 
+// Helper function to extract audio using raw command with multiple strategies
+async function extractAudio(videoId) {
+  const url = `https://www.youtube.com/watch?v=${videoId}`;
+  const tempOutput = path.join(os.tmpdir(), `${videoId}.%(ext)s`);
+  const finalPath = path.join(os.tmpdir(), `${videoId}.mp3`);
+
+  // Strategy 1: Try with standard options
+  try {
+    const command = `"${ytdlpPath}" "${url}" \
+      --cookies "${cookiesPath}" \
+      --config-location "${configPath}" \
+      -x --audio-format mp3 --audio-quality 0 \
+      -o "${tempOutput}"`;
+
+    console.log(`Running yt-dlp command (Strategy 1):\n${command}\n`);
+    const { stdout, stderr } = await execPromise(command);
+    console.log(stdout);
+    if (stderr) console.warn(stderr);
+    
+    if (fs.existsSync(finalPath)) {
+      const buffer = await fs.promises.readFile(finalPath);
+      fs.unlinkSync(finalPath);
+      return buffer;
+    }
+  } catch (err) {
+    console.warn('Strategy 1 failed:', err.message);
+  }
+
+  // Strategy 2: Try with additional bypass options
+  try {
+    const command = `"${ytdlpPath}" "${url}" \
+      --cookies "${cookiesPath}" \
+      --config-location "${configPath}" \
+      --add-header "Referer:https://www.youtube.com/" \
+      --add-header "Origin:https://www.youtube.com" \
+      --sleep-interval 1 --max-sleep-interval 5 \
+      -x --audio-format mp3 --audio-quality 0 \
+      -o "${tempOutput}"`;
+
+    console.log(`Running yt-dlp command (Strategy 2):\n${command}\n`);
+    const { stdout, stderr } = await execPromise(command);
+    console.log(stdout);
+    if (stderr) console.warn(stderr);
+    
+    if (fs.existsSync(finalPath)) {
+      const buffer = await fs.promises.readFile(finalPath);
+      fs.unlinkSync(finalPath);
+      return buffer;
+    }
+  } catch (err) {
+    console.warn('Strategy 2 failed:', err.message);
+  }
+
+  // Strategy 3: Try with a direct format selection
+  try {
+    // First list available formats
+    const formatListCmd = `"${ytdlpPath}" -F "${url}" --cookies "${cookiesPath}"`;
+    console.log(`Listing formats:\n${formatListCmd}\n`);
+    const { stdout } = await execPromise(formatListCmd);
+    console.log('Available formats:\n' + stdout);
+    
+    // Extract a good audio format ID (usually m4a or webm)
+    const formatMatch = stdout.match(/(\d+)\s+audio only.*?(m4a|webm)/i);
+    if (formatMatch && formatMatch[1]) {
+      const formatId = formatMatch[1];
+      
+      const command = `"${ytdlpPath}" "${url}" \
+        --cookies "${cookiesPath}" \
+        --config-location "${configPath}" \
+        -f ${formatId} \
+        --recode-video mp3 \
+        -o "${tempOutput}"`;
+
+      console.log(`Running yt-dlp command (Strategy 3 with format ${formatId}):\n${command}\n`);
+      const { stdout, stderr } = await execPromise(command);
+      console.log(stdout);
+      if (stderr) console.warn(stderr);
+      
+      if (fs.existsSync(finalPath)) {
+        const buffer = await fs.promises.readFile(finalPath);
+        fs.unlinkSync(finalPath);
+        return buffer;
+      }
+    }
+  } catch (err) {
+    console.warn('Strategy 3 failed:', err.message);
+  }
+
+  // Strategy 4: Try with cookies from browser
+  try {
+    const command = `"${ytdlpPath}" "${url}" \
+      --cookies-from-browser chrome \
+      --config-location "${configPath}" \
+      -x --audio-format mp3 --audio-quality 0 \
+      -o "${tempOutput}"`;
+
+    console.log(`Running yt-dlp command (Strategy 4):\n${command}\n`);
+    const { stdout, stderr } = await execPromise(command);
+    console.log(stdout);
+    if (stderr) console.warn(stderr);
+    
+    if (fs.existsSync(finalPath)) {
+      const buffer = await fs.promises.readFile(finalPath);
+      fs.unlinkSync(finalPath);
+      return buffer;
+    }
+  } catch (err) {
+    console.warn('Strategy 4 failed:', err.message);
+  }
+
+  throw new Error('All extraction strategies failed');
+}
+
 // Initialize server only after yt-dlp is ready
 let ytDlp;
 initializeYtDlp()
@@ -94,63 +227,20 @@ initializeYtDlp()
     process.exit(1);
   });
 
-// Helper function to extract audio using raw command
-async function extractAudio(videoId) {
-  const url = `https://www.youtube.com/watch?v=${videoId}`;
-  const tempOutput = path.join(os.tmpdir(), `${videoId}.%(ext)s`);
-  const finalPath = path.join(os.tmpdir(), `${videoId}.mp3`);
-
-  const command = `"${ytdlpPath}" "${url}" \
-    --cookies "${cookiesPath}" \
-    --config-location "${configPath}" \
-    -x --audio-format mp3 --audio-quality 0 \
-    -o "${tempOutput}"`;
-
-  console.log(`Running yt-dlp command:\n${command}\n`);
-
-  try {
-    const { stdout, stderr } = await execPromise(command);
-    console.log(stdout);
-    if (stderr) console.warn(stderr);
-
-    if (!existsSync(finalPath)) {
-      throw new Error(`Audio file not created at ${finalPath}`);
-    }
-
-    const buffer = await fs.readFile(finalPath);
-    unlinkSync(finalPath); // cleanup
-
-    return buffer;
-  } catch (err) {
-    console.error('Audio fetch error:', err);
-
-    // Helpful diagnostic: try listing formats
-    try {
-      const formatListCmd = `"${ytdlpPath}" -F "${url}" --cookies "${cookiesPath}"`;
-      const { stdout } = await execPromise(formatListCmd);
-      console.log('Available formats:\n' + stdout);
-    } catch (innerErr) {
-      console.error('Failed to list formats:', innerErr);
-    }
-
-    throw err;
-  }
-}
-
-
-
 // Define routes and start server
 function startServer() {
+  // Audio endpoint to stream audio files
   app.get('/audio/:videoId', async (req, res) => {
     const { videoId } = req.params;
+    const cacheKey = `audio-${videoId}`;
     
     try {
-      let buffer = audioCache.get(videoId);
+      let buffer = audioCache.get(cacheKey);
 
       if (!buffer) {
+        console.log(`Fetching audio for video ID: ${videoId}`);
         try {
           // First try with the YtDlp class
-          console.log(`Fetching audio for video ID: ${videoId}`);
           const file = await ytDlp.getFileAsync(`https://www.youtube.com/watch?v=${videoId}`, {
             format: {
               filter: 'audioonly',
@@ -162,12 +252,12 @@ function startServer() {
           buffer = Buffer.from(await file.arrayBuffer());
         } catch (classError) {
           console.warn('YtDlp class method failed, falling back to command:', classError.message);
-          // Fallback to our command-line extraction method
+          // Fallback to our multi-strategy extraction method
           buffer = await extractAudio(videoId);
         }
         
         // Cache the result
-        audioCache.set(videoId, buffer);
+        audioCache.set(cacheKey, buffer);
       }
 
       const total = buffer.length;
@@ -198,6 +288,56 @@ function startServer() {
     } catch (err) {
       console.error('Audio fetch error:', err);
       res.status(500).send('Failed to load audio: ' + err.message);
+    }
+  });
+
+  // Status endpoint to check if YouTube cookies are working
+  app.get('/status', async (req, res) => {
+    try {
+      const testUrl = 'https://www.youtube.com/watch?v=dQw4w9WgXcQ'; // A popular video
+      const command = `"${ytdlpPath}" -F "${testUrl}" --cookies "${cookiesPath}" --skip-download`;
+      const { stdout } = await execPromise(command);
+      res.json({ 
+        status: 'ok', 
+        message: 'YouTube API is accessible',
+        formats: stdout.split('\n').length - 1
+      });
+    } catch (err) {
+      res.status(500).json({ 
+        status: 'error', 
+        message: 'YouTube API is not accessible',
+        error: err.message 
+      });
+    }
+  });
+
+  // Cookie validation endpoint to check/update cookies
+  app.get('/validate-cookies', async (req, res) => {
+    if (!fs.existsSync(cookiesPath)) {
+      return res.status(404).json({
+        status: 'error',
+        message: 'No cookies file found'
+      });
+    }
+    
+    try {
+      const stats = fs.statSync(cookiesPath);
+      const fileSize = stats.size;
+      const lastModified = stats.mtime;
+      
+      res.json({
+        status: 'ok',
+        cookiesPath: cookiesPath,
+        fileSize: `${fileSize} bytes`,
+        lastModified: lastModified,
+        message: 'Cookies file exists'
+      });
+    } catch (err) {
+      res.status(500).json({
+        status: 'error',
+        message: 'Error accessing cookies file',
+        error: err.message
+      });
     }
   });
 

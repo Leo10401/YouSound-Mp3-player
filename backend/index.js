@@ -1,6 +1,6 @@
 import express from 'express';
 import cors from 'cors';
-import { YtDlp, BIN_DIR } from 'ytdlp-nodejs';
+import youtubedl from 'youtube-dl-exec';
 import NodeCache from 'node-cache';
 import dotenv from 'dotenv';
 import path from 'path';
@@ -27,22 +27,23 @@ const apiLimiter = rateLimit({
 app.use(cors());
 app.use('/audio', apiLimiter);
 
-// First, ensure binary directory exists
-if (!fs.existsSync(BIN_DIR)) {
-  fs.mkdirSync(BIN_DIR, { recursive: true });
-}
-
-// Path for yt-dlp binary
-const ytdlpPath = path.join(BIN_DIR, process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
+// The bin directory will be managed by youtube-dl-exec
+const BIN_DIR = path.join(process.cwd(), 'bin');
 const cookiesPath = path.join(os.tmpdir(), 'youtube_cookies.txt');
 
-// Create a config directory for yt-dlp
+// Create a directory for temporary files
+const tmpDir = path.join(os.tmpdir(), 'yt-download');
+if (!fs.existsSync(tmpDir)) {
+  fs.mkdirSync(tmpDir, { recursive: true });
+}
+
+// Create yt-dlp config with increased rate limit and additional options
 const configDir = path.join(os.tmpdir(), 'yt-dlp-config');
 if (!fs.existsSync(configDir)) {
   fs.mkdirSync(configDir, { recursive: true });
 }
 
-// Create a yt-dlp config file with increased rate limit and additional options
+// Create a yt-dlp config file with additional options
 const configPath = path.join(configDir, 'config');
 const configContent = `
 --geo-bypass
@@ -68,62 +69,34 @@ if (process.env.YOUTUBE_COOKIES_BASE64) {
   }
 }
 
-// Download and initialize yt-dlp
-async function initializeYtDlp() {
-  if (!fs.existsSync(ytdlpPath)) {
-    console.log('yt-dlp binary not found. Downloading...');
-    
-    // Latest stable version URL
-    const ytdlpUrl = process.platform === 'win32' 
-      ? 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe'
-      : 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp';
-    
-    try {
-      // Download yt-dlp binary
-      await execPromise(`curl -L ${ytdlpUrl} -o ${ytdlpPath}`);
-      console.log('yt-dlp downloaded successfully');
-      
-      // Make it executable (except on Windows)
-      if (process.platform !== 'win32') {
-        await execPromise(`chmod +x ${ytdlpPath}`);
-        console.log('yt-dlp permissions set');
-      }
-    } catch (error) {
-      console.error('Error downloading yt-dlp:', error);
-      throw error;
-    }
-  } else {
-    console.log('yt-dlp binary already exists');
-  }
-  
-  // Return initialized YtDlp instance with config path
-  return new YtDlp({ 
-    binaryPath: ytdlpPath
-  });
-}
-
-// Helper function to extract audio using raw command with multiple strategies
+// Helper function to extract audio using youtube-dl-exec with multiple strategies
 async function extractAudio(videoId) {
   const url = `https://www.youtube.com/watch?v=${videoId}`;
-  const tempOutput = path.join(os.tmpdir(), `${videoId}.%(ext)s`);
-  const finalPath = path.join(os.tmpdir(), `${videoId}.mp3`);
+  const outputPath = path.join(tmpDir, `${videoId}.mp3`);
+  
+  const commonOptions = {
+    output: outputPath,
+    extractAudio: true,
+    audioFormat: 'mp3',
+    audioQuality: 0,
+    configLocation: configPath
+  };
+  
+  // If cookies file exists, add it to options
+  if (fs.existsSync(cookiesPath)) {
+    commonOptions.cookies = cookiesPath;
+  }
 
   // Strategy 1: Try with standard options
   try {
-    const command = `"${ytdlpPath}" "${url}" \
-      --cookies "${cookiesPath}" \
-      --config-location "${configPath}" \
-      -x --audio-format mp3 --audio-quality 0 \
-      -o "${tempOutput}"`;
-
-    console.log(`Running yt-dlp command (Strategy 1):\n${command}\n`);
-    const { stdout, stderr } = await execPromise(command);
-    console.log(stdout);
-    if (stderr) console.warn(stderr);
+    console.log(`Extracting audio for ${url} (Strategy 1)`);
+    await youtubedl(url, {
+      ...commonOptions
+    });
     
-    if (fs.existsSync(finalPath)) {
-      const buffer = await fs.promises.readFile(finalPath);
-      fs.unlinkSync(finalPath);
+    if (fs.existsSync(outputPath)) {
+      const buffer = await fs.promises.readFile(outputPath);
+      fs.unlinkSync(outputPath);
       return buffer;
     }
   } catch (err) {
@@ -132,23 +105,20 @@ async function extractAudio(videoId) {
 
   // Strategy 2: Try with additional bypass options
   try {
-    const command = `"${ytdlpPath}" "${url}" \
-      --cookies "${cookiesPath}" \
-      --config-location "${configPath}" \
-      --add-header "Referer:https://www.youtube.com/" \
-      --add-header "Origin:https://www.youtube.com" \
-      --sleep-interval 1 --max-sleep-interval 5 \
-      -x --audio-format mp3 --audio-quality 0 \
-      -o "${tempOutput}"`;
-
-    console.log(`Running yt-dlp command (Strategy 2):\n${command}\n`);
-    const { stdout, stderr } = await execPromise(command);
-    console.log(stdout);
-    if (stderr) console.warn(stderr);
+    console.log(`Extracting audio for ${url} (Strategy 2)`);
+    await youtubedl(url, {
+      ...commonOptions,
+      addHeader: [
+        'Referer:https://www.youtube.com/',
+        'Origin:https://www.youtube.com'
+      ],
+      sleepInterval: 1,
+      maxSleepInterval: 5
+    });
     
-    if (fs.existsSync(finalPath)) {
-      const buffer = await fs.promises.readFile(finalPath);
-      fs.unlinkSync(finalPath);
+    if (fs.existsSync(outputPath)) {
+      const buffer = await fs.promises.readFile(outputPath);
+      fs.unlinkSync(outputPath);
       return buffer;
     }
   } catch (err) {
@@ -158,31 +128,29 @@ async function extractAudio(videoId) {
   // Strategy 3: Try with a direct format selection
   try {
     // First list available formats
-    const formatListCmd = `"${ytdlpPath}" -F "${url}" --cookies "${cookiesPath}"`;
-    console.log(`Listing formats:\n${formatListCmd}\n`);
-    const { stdout } = await execPromise(formatListCmd);
-    console.log('Available formats:\n' + stdout);
+    console.log(`Listing formats for ${url}`);
+    const formatInfo = await youtubedl(url, {
+      listFormats: true,
+      cookies: cookiesPath
+    });
+    
+    console.log('Available formats:\n' + formatInfo);
     
     // Extract a good audio format ID (usually m4a or webm)
-    const formatMatch = stdout.match(/(\d+)\s+audio only.*?(m4a|webm)/i);
+    const formatMatch = formatInfo.match(/(\d+)\s+audio only.*?(m4a|webm)/i);
     if (formatMatch && formatMatch[1]) {
       const formatId = formatMatch[1];
       
-      const command = `"${ytdlpPath}" "${url}" \
-        --cookies "${cookiesPath}" \
-        --config-location "${configPath}" \
-        -f ${formatId} \
-        --recode-video mp3 \
-        -o "${tempOutput}"`;
-
-      console.log(`Running yt-dlp command (Strategy 3 with format ${formatId}):\n${command}\n`);
-      const { stdout, stderr } = await execPromise(command);
-      console.log(stdout);
-      if (stderr) console.warn(stderr);
+      console.log(`Extracting audio for ${url} (Strategy 3 with format ${formatId})`);
+      await youtubedl(url, {
+        ...commonOptions,
+        format: formatId,
+        recodeVideo: 'mp3'
+      });
       
-      if (fs.existsSync(finalPath)) {
-        const buffer = await fs.promises.readFile(finalPath);
-        fs.unlinkSync(finalPath);
+      if (fs.existsSync(outputPath)) {
+        const buffer = await fs.promises.readFile(outputPath);
+        fs.unlinkSync(outputPath);
         return buffer;
       }
     }
@@ -192,20 +160,15 @@ async function extractAudio(videoId) {
 
   // Strategy 4: Try with cookies from browser
   try {
-    const command = `"${ytdlpPath}" "${url}" \
-      --cookies-from-browser chrome \
-      --config-location "${configPath}" \
-      -x --audio-format mp3 --audio-quality 0 \
-      -o "${tempOutput}"`;
-
-    console.log(`Running yt-dlp command (Strategy 4):\n${command}\n`);
-    const { stdout, stderr } = await execPromise(command);
-    console.log(stdout);
-    if (stderr) console.warn(stderr);
+    console.log(`Extracting audio for ${url} (Strategy 4)`);
+    await youtubedl(url, {
+      ...commonOptions,
+      cookiesFromBrowser: 'chrome'
+    });
     
-    if (fs.existsSync(finalPath)) {
-      const buffer = await fs.promises.readFile(finalPath);
-      fs.unlinkSync(finalPath);
+    if (fs.existsSync(outputPath)) {
+      const buffer = await fs.promises.readFile(outputPath);
+      fs.unlinkSync(outputPath);
       return buffer;
     }
   } catch (err) {
@@ -214,18 +177,6 @@ async function extractAudio(videoId) {
 
   throw new Error('All extraction strategies failed');
 }
-
-// Initialize server only after yt-dlp is ready
-let ytDlp;
-initializeYtDlp()
-  .then(ytDlpInstance => {
-    ytDlp = ytDlpInstance;
-    startServer();
-  })
-  .catch(error => {
-    console.error('Failed to initialize yt-dlp:', error);
-    process.exit(1);
-  });
 
 // Define routes and start server
 function startServer() {
@@ -240,20 +191,11 @@ function startServer() {
       if (!buffer) {
         console.log(`Fetching audio for video ID: ${videoId}`);
         try {
-          // First try with the YtDlp class
-          const file = await ytDlp.getFileAsync(`https://www.youtube.com/watch?v=${videoId}`, {
-            format: {
-              filter: 'audioonly',
-              type: 'mp3',
-              quality: 'highest',
-            },
-            filename: `${videoId}.mp3`,
-          });
-          buffer = Buffer.from(await file.arrayBuffer());
-        } catch (classError) {
-          console.warn('YtDlp class method failed, falling back to command:', classError.message);
-          // Fallback to our multi-strategy extraction method
+          // Extract audio using youtube-dl-exec
           buffer = await extractAudio(videoId);
+        } catch (error) {
+          console.error('Audio extraction failed:', error.message);
+          return res.status(500).send('Failed to extract audio: ' + error.message);
         }
         
         // Cache the result
@@ -295,12 +237,16 @@ function startServer() {
   app.get('/status', async (req, res) => {
     try {
       const testUrl = 'https://www.youtube.com/watch?v=dQw4w9WgXcQ'; // A popular video
-      const command = `"${ytdlpPath}" -F "${testUrl}" --cookies "${cookiesPath}" --skip-download`;
-      const { stdout } = await execPromise(command);
+      const result = await youtubedl.exec(testUrl, {
+        skipDownload: true,
+        cookies: cookiesPath,
+        f: true // List formats
+      });
+      
       res.json({ 
         status: 'ok', 
         message: 'YouTube API is accessible',
-        formats: stdout.split('\n').length - 1
+        formats: result.stdout.split('\n').length - 1
       });
     } catch (err) {
       res.status(500).json({ 
@@ -350,3 +296,6 @@ function startServer() {
     console.log(`🎧 Audio server running on port ${PORT}`);
   });
 }
+
+// Start the server immediately since youtube-dl-exec handles binary installation
+startServer();

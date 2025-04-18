@@ -21,6 +21,7 @@
     "node-cache": "^5.1.2",
     "nodemon": "^3.1.9",
     "range-parser": "^1.2.1",
+    "youtube-dl-exec": "^3.0.20",
     "ytdlp-nodejs": "^2.0.5"
   }
 }

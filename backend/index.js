@@ -17,11 +17,16 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const audioCache = new NodeCache({ stdTTL: 3600 }); // 1 hour cache
 
+// Fix for the X-Forwarded-For header issue - Enable trust proxy
+app.set('trust proxy', 1);
+
 // Rate limiter to avoid excessive YouTube requests
 const apiLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
   max: 30, // limit each IP to 30 requests per windowMs
-  message: 'Too many requests, please try again later'
+  message: 'Too many requests, please try again later',
+  standardHeaders: true,
+  legacyHeaders: false
 });
 
 app.use(cors());
@@ -69,17 +74,31 @@ if (process.env.YOUTUBE_COOKIES_BASE64) {
   }
 }
 
-// Helper function to extract audio using youtube-dl-exec with multiple strategies
+// Helper function to extract audio using youtube-dl-exec with better error handling
 async function extractAudio(videoId) {
   const url = `https://www.youtube.com/watch?v=${videoId}`;
   const outputPath = path.join(tmpDir, `${videoId}.mp3`);
+  
+  // Make sure temporary directory exists
+  if (!fs.existsSync(tmpDir)) {
+    fs.mkdirSync(tmpDir, { recursive: true });
+  }
+
+  // Clear any previous output file if it exists
+  if (fs.existsSync(outputPath)) {
+    try {
+      fs.unlinkSync(outputPath);
+    } catch (err) {
+      console.warn(`Failed to remove existing output file: ${err.message}`);
+    }
+  }
   
   const commonOptions = {
     output: outputPath,
     extractAudio: true,
     audioFormat: 'mp3',
     audioQuality: 0,
-    configLocation: configPath
+    verbose: true // Add verbose output for debugging
   };
   
   // If cookies file exists, add it to options
@@ -87,95 +106,122 @@ async function extractAudio(videoId) {
     commonOptions.cookies = cookiesPath;
   }
 
-  // Strategy 1: Try with standard options
+  // Strategy 1: Direct download with verbose output
   try {
     console.log(`Extracting audio for ${url} (Strategy 1)`);
-    await youtubedl(url, {
-      ...commonOptions
+    const { stdout, stderr } = await youtubedl.exec(url, {
+      ...commonOptions,
+      noCheckCertificates: true,
+      preferFreeFormats: true,
+      noWarnings: true,
+      addHeader: ['referer:youtube.com', 'user-agent:googlebot']
     });
+    
+    console.log("Strategy 1 stdout:", stdout);
+    if (stderr) console.warn("Strategy 1 stderr:", stderr);
     
     if (fs.existsSync(outputPath)) {
       const buffer = await fs.promises.readFile(outputPath);
       fs.unlinkSync(outputPath);
       return buffer;
+    } else {
+      console.warn("Output file not found after strategy 1");
     }
   } catch (err) {
     console.warn('Strategy 1 failed:', err.message);
   }
 
-  // Strategy 2: Try with additional bypass options
+  // Strategy 2: Format-specific download
   try {
     console.log(`Extracting audio for ${url} (Strategy 2)`);
-    await youtubedl(url, {
-      ...commonOptions,
+    
+    // Use direct format specification for better compatibility
+    const { stdout, stderr } = await youtubedl.exec(url, {
+      output: outputPath,
+      format: 'bestaudio[ext=m4a]/bestaudio',
+      extractAudio: true,
+      audioFormat: 'mp3',
+      geoBypass: true,
+      noCheckCertificates: true,
       addHeader: [
         'Referer:https://www.youtube.com/',
         'Origin:https://www.youtube.com'
-      ],
-      sleepInterval: 1,
-      maxSleepInterval: 5
+      ]
     });
+    
+    console.log("Strategy 2 stdout:", stdout);
+    if (stderr) console.warn("Strategy 2 stderr:", stderr);
     
     if (fs.existsSync(outputPath)) {
       const buffer = await fs.promises.readFile(outputPath);
       fs.unlinkSync(outputPath);
       return buffer;
+    } else {
+      console.warn("Output file not found after strategy 2");
     }
   } catch (err) {
     console.warn('Strategy 2 failed:', err.message);
   }
 
-  // Strategy 3: Try with a direct format selection
+  // Strategy 3: Use raw command for maximum control
   try {
-    // First list available formats
-    console.log(`Listing formats for ${url}`);
-    const formatInfo = await youtubedl(url, {
-      listFormats: true,
-      cookies: cookiesPath
-    });
-    
-    console.log('Available formats:\n' + formatInfo);
-    
-    // Extract a good audio format ID (usually m4a or webm)
-    const formatMatch = formatInfo.match(/(\d+)\s+audio only.*?(m4a|webm)/i);
-    if (formatMatch && formatMatch[1]) {
-      const formatId = formatMatch[1];
-      
-      console.log(`Extracting audio for ${url} (Strategy 3 with format ${formatId})`);
-      await youtubedl(url, {
-        ...commonOptions,
-        format: formatId,
-        recodeVideo: 'mp3'
-      });
-      
-      if (fs.existsSync(outputPath)) {
-        const buffer = await fs.promises.readFile(outputPath);
-        fs.unlinkSync(outputPath);
-        return buffer;
-      }
-    }
-  } catch (err) {
-    console.warn('Strategy 3 failed:', err.message);
-  }
+    const ytdlpPath = path.join(BIN_DIR, process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
+    console.log(`Using raw command with binary at: ${ytdlpPath}`);
 
-  // Strategy 4: Try with cookies from browser
-  try {
-    console.log(`Extracting audio for ${url} (Strategy 4)`);
-    await youtubedl(url, {
-      ...commonOptions,
-      cookiesFromBrowser: 'chrome'
-    });
+    // Execute with raw command for more control
+    const command = `"${ytdlpPath}" "${url}" -x --audio-format mp3 --audio-quality 0 -o "${outputPath}" --geo-bypass --no-check-certificates`;
+    
+    console.log(`Running raw command: ${command}`);
+    const { stdout, stderr } = await execPromise(command);
+    
+    console.log("Strategy 3 stdout:", stdout);
+    if (stderr) console.warn("Strategy 3 stderr:", stderr);
     
     if (fs.existsSync(outputPath)) {
       const buffer = await fs.promises.readFile(outputPath);
       fs.unlinkSync(outputPath);
       return buffer;
+    } else {
+      console.warn("Output file not found after strategy 3");
+    }
+  } catch (err) {
+    console.warn('Strategy 3 failed:', err.message);
+  }
+
+  // Strategy 4: Attempt download with youtube-dl fallback
+  try {
+    console.log(`Fallback to youtube-dl command for ${url} (Strategy 4)`);
+    
+    // Create a fallback instance with youtube-dl
+    const { create: createYoutubeDl } = youtubedl;
+    const altYoutubeDl = createYoutubeDl(
+      path.join(BIN_DIR, process.platform === 'win32' ? 'youtube-dl.exe' : 'youtube-dl')
+    );
+    
+    const { stdout, stderr } = await altYoutubeDl.exec(url, {
+      output: outputPath,
+      extractAudio: true,
+      audioFormat: 'mp3',
+      audioQuality: 0,
+      noCheckCertificate: true,
+      format: 'bestaudio'
+    });
+    
+    console.log("Strategy 4 stdout:", stdout);
+    if (stderr) console.warn("Strategy 4 stderr:", stderr);
+    
+    if (fs.existsSync(outputPath)) {
+      const buffer = await fs.promises.readFile(outputPath);
+      fs.unlinkSync(outputPath);
+      return buffer;
+    } else {
+      console.warn("Output file not found after strategy 4");
     }
   } catch (err) {
     console.warn('Strategy 4 failed:', err.message);
   }
 
-  throw new Error('All extraction strategies failed');
+  throw new Error('All extraction strategies failed. Could not download audio from YouTube.');
 }
 
 // Define routes and start server
@@ -239,7 +285,6 @@ function startServer() {
       const testUrl = 'https://www.youtube.com/watch?v=dQw4w9WgXcQ'; // A popular video
       const result = await youtubedl.exec(testUrl, {
         skipDownload: true,
-        cookies: cookiesPath,
         f: true // List formats
       });
       
@@ -292,10 +337,48 @@ function startServer() {
     res.status(200).send('OK');
   });
 
+  // Add a debugging endpoint to check binary paths
+  app.get('/debug', async (req, res) => {
+    try {
+      const binFiles = fs.existsSync(BIN_DIR) ? fs.readdirSync(BIN_DIR) : [];
+      const ytdlpPath = path.join(BIN_DIR, process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
+      const ytdlpExists = fs.existsSync(ytdlpPath);
+      
+      // Try to get version info
+      let versionInfo = "Unknown";
+      try {
+        const { stdout } = await execPromise(`"${ytdlpPath}" --version`);
+        versionInfo = stdout.trim();
+      } catch (e) {
+        versionInfo = `Error getting version: ${e.message}`;
+      }
+      
+      res.json({
+        platform: process.platform,
+        binDir: BIN_DIR,
+        binFiles,
+        ytdlpPath,
+        ytdlpExists,
+        ytdlpVersion: versionInfo,
+        tmpDir,
+        configDir,
+        configPath: configPath,
+        cookiesPath,
+        cookiesExist: fs.existsSync(cookiesPath)
+      });
+    } catch (err) {
+      res.status(500).json({
+        status: 'error',
+        message: 'Error getting debug info',
+        error: err.message
+      });
+    }
+  });
+
   app.listen(PORT, () => {
     console.log(`🎧 Audio server running on port ${PORT}`);
   });
 }
 
-// Start the server immediately since youtube-dl-exec handles binary installation
+// Start the server immediately
 startServer();

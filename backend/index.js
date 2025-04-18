@@ -97,28 +97,46 @@ initializeYtDlp()
 // Helper function to extract audio using raw command
 async function extractAudio(videoId) {
   const url = `https://www.youtube.com/watch?v=${videoId}`;
-  const outputPath = path.join(os.tmpdir(), `${videoId}.mp3`);
-  const cookiesPath = path.resolve('./youtube_cookies.txt'); // Put your cookies file in the project root
+  const tempOutput = path.join(os.tmpdir(), `${videoId}.%(ext)s`);
+  const finalPath = path.join(os.tmpdir(), `${videoId}.mp3`);
 
-  if (!fs.existsSync(outputPath)) {
-    try {
-      const command = `"${ytdlpPath}" "${url}" --cookies "${cookiesPath}" --config-location "${configPath}" -f "bestaudio" -x --audio-format mp3 --audio-quality 0 -o "${outputPath}"`;
-      console.log(`Executing command: ${command}`);
-      await execPromise(command);
+  const command = `"${ytdlpPath}" "${url}" \
+    --cookies "${cookiesPath}" \
+    --config-location "${configPath}" \
+    -x --audio-format mp3 --audio-quality 0 \
+    -o "${tempOutput}"`;
 
-      if (fs.existsSync(outputPath)) {
-        const buffer = fs.readFileSync(outputPath);
-        fs.unlinkSync(outputPath);
-        return buffer;
-      } else {
-        throw new Error('Output file not created');
-      }
-    } catch (error) {
-      console.error('Error extracting audio with command:', error);
-      throw error;
+  console.log(`Running yt-dlp command:\n${command}\n`);
+
+  try {
+    const { stdout, stderr } = await execPromise(command);
+    console.log(stdout);
+    if (stderr) console.warn(stderr);
+
+    if (!existsSync(finalPath)) {
+      throw new Error(`Audio file not created at ${finalPath}`);
     }
+
+    const buffer = await fs.readFile(finalPath);
+    unlinkSync(finalPath); // cleanup
+
+    return buffer;
+  } catch (err) {
+    console.error('Audio fetch error:', err);
+
+    // Helpful diagnostic: try listing formats
+    try {
+      const formatListCmd = `"${ytdlpPath}" -F "${url}" --cookies "${cookiesPath}"`;
+      const { stdout } = await execPromise(formatListCmd);
+      console.log('Available formats:\n' + stdout);
+    } catch (innerErr) {
+      console.error('Failed to list formats:', innerErr);
+    }
+
+    throw err;
   }
 }
+
 
 
 // Define routes and start server

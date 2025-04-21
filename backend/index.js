@@ -1,6 +1,5 @@
 import express from 'express';
 import cors from 'cors';
-import youtubedl from 'youtube-dl-exec';
 import NodeCache from 'node-cache';
 import dotenv from 'dotenv';
 import path from 'path';
@@ -33,24 +32,26 @@ const apiLimiter = rateLimit({
 app.use(cors());
 app.use('/audio', apiLimiter);
 
-// The bin directory will be managed by youtube-dl-exec
+// Directory and file paths
 const BIN_DIR = path.join(process.cwd(), 'bin');
 const cookiesPath = path.join(os.tmpdir(), 'youtube_cookies.txt');
-
-// Create a directory for temporary files
 const tmpDir = path.join(os.tmpdir(), 'yt-download');
-if (!fs.existsSync(tmpDir)) {
-  fs.mkdirSync(tmpDir, { recursive: true });
-}
-
-// Create yt-dlp config with increased rate limit and additional options
 const configDir = path.join(os.tmpdir(), 'yt-dlp-config');
-if (!fs.existsSync(configDir)) {
-  fs.mkdirSync(configDir, { recursive: true });
+const configPath = path.join(configDir, 'config');
+
+// Binary paths
+const ytdlpPath = path.join(BIN_DIR, process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
+const ytdlPath = path.join(BIN_DIR, process.platform === 'win32' ? 'youtube-dl.exe' : 'youtube-dl');
+
+// Create required directories
+for (const dir of [BIN_DIR, tmpDir, configDir]) {
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+    console.log(`Created directory: ${dir}`);
+  }
 }
 
 // Create a yt-dlp config file with additional options
-const configPath = path.join(configDir, 'config');
 const configContent = `
 --geo-bypass
 --no-check-certificate
@@ -63,6 +64,7 @@ const configContent = `
 `;
 
 fs.writeFileSync(configPath, configContent);
+console.log(`Created config file at: ${configPath}`);
 
 // Load YouTube cookies from environment variable if available
 if (process.env.YOUTUBE_COOKIES_BASE64) {
@@ -75,364 +77,325 @@ if (process.env.YOUTUBE_COOKIES_BASE64) {
   }
 }
 
-// Helper function to download yt-dlp binary directly
+/**
+ * Downloads the yt-dlp binary with proper error handling
+ */
 async function downloadYtDlp() {
-  const targetPath = path.join(BIN_DIR, process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
-  const url = process.platform === 'win32' 
-    ? 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe'
-    : 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp';
-    
-  console.log(`Downloading yt-dlp from ${url} to ${targetPath}`);
-  
-  // Create directory if it doesn't exist
-  if (!fs.existsSync(path.dirname(targetPath))) {
-    fs.mkdirSync(path.dirname(targetPath), { recursive: true });
-  }
+  console.log('Starting yt-dlp download...');
   
   try {
-    const file = fs.createWriteStream(targetPath);
+    // Create bin directory if it doesn't exist
+    if (!fs.existsSync(BIN_DIR)) {
+      fs.mkdirSync(BIN_DIR, { recursive: true });
+      console.log(`Created bin directory at ${BIN_DIR}`);
+    }
     
-    await new Promise((resolve, reject) => {
-      https.get(url, response => {
-        response.pipe(file);
-        file.on('finish', () => {
-          file.close();
-          fs.chmodSync(targetPath, 0o755); // Make executable
-          console.log(`Downloaded yt-dlp to ${targetPath}`);
-          resolve();
+    // Remove existing binary if it exists (to ensure a clean download)
+    if (fs.existsSync(ytdlpPath)) {
+      fs.unlinkSync(ytdlpPath);
+      console.log(`Removed existing binary at ${ytdlpPath}`);
+    }
+    
+    // Try multiple download approaches
+    
+    // Approach 1: Use curl (most reliable)
+    try {
+      console.log('Downloading yt-dlp using curl...');
+      const url = process.platform === 'win32' 
+        ? 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe'
+        : 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp';
+      
+      await execPromise(`curl -L "${url}" -o "${ytdlpPath}"`);
+      fs.chmodSync(ytdlpPath, 0o755);
+      console.log(`Successfully downloaded yt-dlp using curl to ${ytdlpPath}`);
+      return true;
+    } catch (err) {
+      console.warn('curl download failed:', err.message);
+    }
+    
+    // Approach 2: Use HTTPS module
+    try {
+      console.log('Downloading yt-dlp using https module...');
+      const url = process.platform === 'win32' 
+        ? 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe'
+        : 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp';
+      
+      await new Promise((resolve, reject) => {
+        const file = fs.createWriteStream(ytdlpPath);
+        https.get(url, response => {
+          response.pipe(file);
+          file.on('finish', () => {
+            file.close();
+            fs.chmodSync(ytdlpPath, 0o755);
+            console.log(`Downloaded yt-dlp using https to ${ytdlpPath}`);
+            resolve();
+          });
+        }).on('error', err => {
+          if (fs.existsSync(ytdlpPath)) fs.unlinkSync(ytdlpPath);
+          reject(err);
         });
-      }).on('error', err => {
-        fs.unlinkSync(targetPath);
-        reject(err);
       });
-    });
+      return true;
+    } catch (err) {
+      console.warn('https download failed:', err.message);
+    }
     
-    return true;
+    // Approach 3: Try using wget
+    try {
+      console.log('Downloading yt-dlp using wget...');
+      const url = process.platform === 'win32' 
+        ? 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe'
+        : 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp';
+      
+      await execPromise(`wget "${url}" -O "${ytdlpPath}"`);
+      fs.chmodSync(ytdlpPath, 0o755);
+      console.log(`Successfully downloaded yt-dlp using wget to ${ytdlpPath}`);
+      return true;
+    } catch (err) {
+      console.warn('wget download failed:', err.message);
+    }
+    
+    console.error('All download approaches failed!');
+    return false;
   } catch (error) {
     console.error('Failed to download yt-dlp:', error);
     return false;
   }
 }
 
-// Function to ensure yt-dlp binary is available
-async function ensureYtDlpBinary() {
+/**
+ * Verifies that the yt-dlp binary exists and is executable
+ */
+async function verifyYtDlpBinary() {
+  console.log('Verifying yt-dlp binary...');
+  
   try {
-    // Check if bin directory exists
-    if (!fs.existsSync(BIN_DIR)) {
-      fs.mkdirSync(BIN_DIR, { recursive: true });
-      console.log(`Created bin directory at ${BIN_DIR}`);
-    }
-    
-    // Try to use youtube-dl-exec's binary
-    try {
-      await youtubedl.exec('--version', {});
-      console.log('yt-dlp binary is available via youtube-dl-exec');
-      
-      // Try to get the binary path
-      let binPath;
-      try {
-        // This is not a standard function but works if available
-        if (typeof youtubedl.getBinaryPath === 'function') {
-          binPath = youtubedl.getBinaryPath();
-          console.log(`yt-dlp binary path from youtube-dl-exec: ${binPath}`);
-        }
-      } catch (e) {
-        console.log('Could not get binary path from youtube-dl-exec:', e.message);
-      }
-      
-      // If running on Render, try to copy from node_modules
-      if (process.env.RENDER || process.env.IS_RENDER) {
-        const nodeBinPath = path.join(process.cwd(), 'node_modules', 'youtube-dl-exec', 'bin');
-        if (fs.existsSync(nodeBinPath)) {
-          const files = fs.readdirSync(nodeBinPath);
-          console.log(`Found in node_modules bin: ${files.join(', ')}`);
-          
-          // Copy the binary to our bin directory
-          for (const file of files) {
-            if (file.includes('yt-dlp')) {
-              const source = path.join(nodeBinPath, file);
-              const target = path.join(BIN_DIR, process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
-              fs.copyFileSync(source, target);
-              fs.chmodSync(target, 0o755); // Make executable
-              console.log(`Copied ${file} to ${target}`);
-            }
-          }
-        }
-      }
-    } catch (error) {
-      console.warn('youtube-dl-exec binary check failed:', error.message);
-      console.log('Attempting direct download as fallback...');
-      await downloadYtDlp();
-    }
-    
-    // Verify the binary exists in our bin directory
-    const expectedPath = path.join(BIN_DIR, process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
-    if (!fs.existsSync(expectedPath)) {
-      console.log(`Binary not found at ${expectedPath}, attempting direct download`);
-      await downloadYtDlp();
-    } else {
-      console.log(`Binary found at ${expectedPath}`);
-      // Ensure it's executable
-      fs.chmodSync(expectedPath, 0o755);
-    }
-    
-    // Final verification test
-    try {
-      const { stdout } = await execPromise(`"${expectedPath}" --version`);
-      console.log(`yt-dlp version: ${stdout.trim()}`);
-      return true;
-    } catch (e) {
-      console.error(`Binary verification failed: ${e.message}`);
+    // Check if binary exists
+    if (!fs.existsSync(ytdlpPath)) {
+      console.log(`Binary not found at ${ytdlpPath}, will download`);
       return false;
     }
+    
+    // Make it executable
+    fs.chmodSync(ytdlpPath, 0o755);
+    
+    // Test if it works
+    const { stdout } = await execPromise(`"${ytdlpPath}" --version`);
+    console.log(`yt-dlp binary verified, version: ${stdout.trim()}`);
+    return true;
   } catch (error) {
-    console.error('Failed to ensure yt-dlp binary:', error);
+    console.error('yt-dlp binary verification failed:', error.message);
     return false;
   }
 }
 
-// Helper function to extract audio using youtube-dl-exec with better error handling
+/**
+ * Ensures the yt-dlp binary is available and working
+ */
+async function ensureYtDlpBinary() {
+  let verified = await verifyYtDlpBinary();
+  
+  if (!verified) {
+    console.log('Binary verification failed, downloading fresh copy...');
+    await downloadYtDlp();
+    verified = await verifyYtDlpBinary();
+  }
+  
+  if (!verified) {
+    console.error('Failed to ensure a working yt-dlp binary after multiple attempts');
+    return false;
+  }
+  
+  console.log('yt-dlp binary is ready to use');
+  return true;
+}
+
+/**
+ * Extract audio from a YouTube video with multiple fallback strategies
+ */
 async function extractAudio(videoId) {
+  console.log(`Starting audio extraction for video ID: ${videoId}`);
   const url = `https://www.youtube.com/watch?v=${videoId}`;
   const outputPath = path.join(tmpDir, `${videoId}.mp3`);
   
-  // Make sure temporary directory exists
-  if (!fs.existsSync(tmpDir)) {
-    fs.mkdirSync(tmpDir, { recursive: true });
-  }
-
-  // Clear any previous output file if it exists
+  // Clean up any existing output file
   if (fs.existsSync(outputPath)) {
     try {
       fs.unlinkSync(outputPath);
+      console.log(`Removed existing output file: ${outputPath}`);
     } catch (err) {
       console.warn(`Failed to remove existing output file: ${err.message}`);
     }
   }
   
-  // Find all possible yt-dlp binary paths
-  const possiblePaths = [
-    path.join(BIN_DIR, process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp'),
-    path.join(process.cwd(), 'node_modules', 'youtube-dl-exec', 'bin', process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp'),
-    '/usr/local/bin/yt-dlp',
-    '/usr/bin/yt-dlp',
-    'yt-dlp' // Let the system try to find it in PATH
-  ];
-  
-  // Log all possible paths for debugging
-  console.log('Possible yt-dlp paths:', possiblePaths);
-  
-  let ytdlpPath = null;
-  for (const p of possiblePaths) {
-    if (fs.existsSync(p)) {
-      ytdlpPath = p;
-      console.log(`Found yt-dlp at: ${ytdlpPath}`);
-      break;
-    }
+  // Make sure binary is ready
+  if (!fs.existsSync(ytdlpPath)) {
+    console.log('Binary not found, downloading...');
+    await downloadYtDlp();
   }
   
-  if (!ytdlpPath) {
-    console.log('No yt-dlp binary found in expected locations. Will try to use youtube-dl-exec default.');
+  // Ensure the binary is executable
+  try {
+    fs.chmodSync(ytdlpPath, 0o755);
+  } catch (err) {
+    console.warn(`Failed to set executable permissions: ${err.message}`);
   }
   
+  // Define common options for all strategies
   const commonOptions = {
-    output: outputPath,
-    extractAudio: true,
-    audioFormat: 'mp3',
-    audioQuality: 0,
-    verbose: true // Add verbose output for debugging
+    '--output': outputPath,
+    '--extract-audio': true,
+    '--audio-format': 'mp3',
+    '--audio-quality': '0',
+    '--geo-bypass': true,
+    '--no-check-certificate': true
   };
   
   // If cookies file exists, add it to options
   if (fs.existsSync(cookiesPath)) {
-    commonOptions.cookies = cookiesPath;
+    commonOptions['--cookies'] = cookiesPath;
   }
-
-  // Strategy 1: Direct download with verbose output
+  
+  // Strategy 1: Direct shell command execution (most reliable)
   try {
-    console.log(`Extracting audio for ${url} (Strategy 1)`);
-    const { stdout, stderr } = await youtubedl.exec(url, {
-      ...commonOptions,
-      noCheckCertificates: true,
-      preferFreeFormats: true,
-      noWarnings: true,
-      addHeader: ['referer:youtube.com', 'user-agent:googlebot']
-    });
+    console.log(`Strategy 1: Direct shell command for ${url}`);
     
-    console.log("Strategy 1 stdout:", stdout);
-    if (stderr) console.warn("Strategy 1 stderr:", stderr);
+    // Build command with all options
+    let command = `"${ytdlpPath}" "${url}"`;
+    for (const [key, value] of Object.entries(commonOptions)) {
+      if (value === true) {
+        command += ` ${key}`;
+      } else {  
+        command += ` ${key} "${value}"`;
+      }
+    }
+    
+    console.log(`Executing command: ${command}`);
+    
+    const { stdout, stderr } = await execPromise(command, { maxBuffer: 10 * 1024 * 1024 });
+    
+    if (stderr) console.log(`Command stderr: ${stderr}`);
+    if (stdout) console.log(`Command stdout: ${stdout.substring(0, 200)}...`);
     
     if (fs.existsSync(outputPath)) {
-      const buffer = await fs.promises.readFile(outputPath);
+      console.log(`Strategy 1 succeeded. File size: ${fs.statSync(outputPath).size} bytes`);
+      const buffer = fs.readFileSync(outputPath);
       fs.unlinkSync(outputPath);
       return buffer;
     } else {
-      console.warn("Output file not found after strategy 1");
+      console.warn('Strategy 1: Output file not found');
     }
   } catch (err) {
-    console.warn('Strategy 1 failed:', err.message);
+    console.warn(`Strategy 1 failed: ${err.message}`);
   }
-
-  // Strategy 2: Format-specific download
+  
+  // Strategy 2: Simplified command with basic options
   try {
-    console.log(`Extracting audio for ${url} (Strategy 2)`);
+    console.log(`Strategy 2: Simplified command for ${url}`);
     
-    // Use direct format specification for better compatibility
-    const { stdout, stderr } = await youtubedl.exec(url, {
-      output: outputPath,
-      format: 'bestaudio[ext=m4a]/bestaudio',
-      extractAudio: true,
-      audioFormat: 'mp3',
-      geoBypass: true,
-      noCheckCertificates: true,
-      addHeader: [
-        'Referer:https://www.youtube.com/',
-        'Origin:https://www.youtube.com'
-      ]
-    });
+    const command = `"${ytdlpPath}" "${url}" -x --audio-format mp3 -o "${outputPath}" --geo-bypass`;
+    console.log(`Executing command: ${command}`);
     
-    console.log("Strategy 2 stdout:", stdout);
-    if (stderr) console.warn("Strategy 2 stderr:", stderr);
-    
-    if (fs.existsSync(outputPath)) {
-      const buffer = await fs.promises.readFile(outputPath);
-      fs.unlinkSync(outputPath);
-      return buffer;
-    } else {
-      console.warn("Output file not found after strategy 2");
-    }
-  } catch (err) {
-    console.warn('Strategy 2 failed:', err.message);
-  }
-
-  // Strategy 3: Use raw command with the found binary path
-  try {
-    // Use the binary path we found earlier
-    const executablePath = ytdlpPath || path.join(BIN_DIR, process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
-    console.log(`Using raw command with binary at: ${executablePath}`);
-
-    // Execute with raw command for more control
-    const command = `"${executablePath}" "${url}" -x --audio-format mp3 --audio-quality 0 -o "${outputPath}" --geo-bypass --no-check-certificate --verbose`;
-    
-    console.log(`Running raw command: ${command}`);
     const { stdout, stderr } = await execPromise(command);
     
-    console.log("Strategy 3 stdout:", stdout);
-    if (stderr) console.warn("Strategy 3 stderr:", stderr);
+    if (stderr) console.log(`Strategy 2 stderr: ${stderr}`);
+    if (stdout) console.log(`Strategy 2 stdout: ${stdout.substring(0, 200)}...`);
     
     if (fs.existsSync(outputPath)) {
-      const buffer = await fs.promises.readFile(outputPath);
+      console.log(`Strategy 2 succeeded. File size: ${fs.statSync(outputPath).size} bytes`);
+      const buffer = fs.readFileSync(outputPath);
       fs.unlinkSync(outputPath);
       return buffer;
     } else {
-      console.warn("Output file not found after strategy 3");
+      console.warn('Strategy 2: Output file not found');
     }
   } catch (err) {
-    console.warn('Strategy 3 failed:', err.message);
+    console.warn(`Strategy 2 failed: ${err.message}`);
   }
-
-  // Strategy 4: Attempt download with youtube-dl fallback
+  
+  // Strategy 3: Try using format selection
   try {
-    console.log(`Fallback to youtube-dl command for ${url} (Strategy 4)`);
+    console.log(`Strategy 3: Format selection for ${url}`);
     
-    // Check if youtube-dl exists or try to download it
-    const ytdlPath = path.join(BIN_DIR, process.platform === 'win32' ? 'youtube-dl.exe' : 'youtube-dl');
-    if (!fs.existsSync(ytdlPath)) {
-      const ytdlUrl = process.platform === 'win32' 
-        ? 'https://yt-dl.org/downloads/latest/youtube-dl.exe'
-        : 'https://yt-dl.org/downloads/latest/youtube-dl';
-        
-      console.log(`Downloading youtube-dl from ${ytdlUrl}`);
-      const file = fs.createWriteStream(ytdlPath);
-      
-      await new Promise((resolve, reject) => {
-        https.get(ytdlUrl, response => {
-          response.pipe(file);
-          file.on('finish', () => {
-            file.close();
-            fs.chmodSync(ytdlPath, 0o755); // Make executable
-            resolve();
-          });
-        }).on('error', err => {
-          fs.unlinkSync(ytdlPath);
-          reject(err);
-        });
-      });
-    }
+    const command = `"${ytdlpPath}" "${url}" -f bestaudio -x --audio-format mp3 -o "${outputPath}"`;
+    console.log(`Executing command: ${command}`);
     
-    // Try using youtube-dl directly
-    const command = `"${ytdlPath}" "${url}" -x --audio-format mp3 --audio-quality 0 -o "${outputPath}" --no-check-certificate`;
     const { stdout, stderr } = await execPromise(command);
     
-    console.log("Strategy 4 stdout:", stdout);
-    if (stderr) console.warn("Strategy 4 stderr:", stderr);
+    if (stderr) console.log(`Strategy 3 stderr: ${stderr}`);
+    if (stdout) console.log(`Strategy 3 stdout: ${stdout.substring(0, 200)}...`);
     
     if (fs.existsSync(outputPath)) {
-      const buffer = await fs.promises.readFile(outputPath);
+      console.log(`Strategy 3 succeeded. File size: ${fs.statSync(outputPath).size} bytes`);
+      const buffer = fs.readFileSync(outputPath);
       fs.unlinkSync(outputPath);
       return buffer;
     } else {
-      console.warn("Output file not found after strategy 4");
+      console.warn('Strategy 3: Output file not found');
     }
   } catch (err) {
-    console.warn('Strategy 4 failed:', err.message);
+    console.warn(`Strategy 3 failed: ${err.message}`);
   }
-
-  // Strategy 5: Try simple curl and ffmpeg approach as last resort
+  
+  // Strategy 4: Use ffmpeg directly if possible
   try {
-    console.log(`Trying curl+ffmpeg approach for ${url} (Strategy 5)`);
+    console.log(`Strategy 4: FFmpeg approach for ${url}`);
     
-    // First get direct URL using youtube-dl --get-url
-    const tempScriptPath = path.join(tmpDir, `get_url_${videoId}.sh`);
-    const getBinaryCmd = ytdlpPath || 'yt-dlp';
+    // First get the best audio URL
+    const getUrlCommand = `"${ytdlpPath}" "${url}" -f bestaudio --get-url`;
+    console.log(`Getting audio URL: ${getUrlCommand}`);
     
-    // Write a small script to get the URL
-    fs.writeFileSync(tempScriptPath, `#!/bin/bash
-${getBinaryCmd} -f 'bestaudio' --get-url "${url}"
-`);
-    fs.chmodSync(tempScriptPath, 0o755);
+    const { stdout: audioUrl } = await execPromise(getUrlCommand);
+    const directUrl = audioUrl.trim();
     
-    // Execute the script
-    const { stdout: directUrl } = await execPromise(`bash ${tempScriptPath}`);
-    const audioUrl = directUrl.trim();
-    
-    if (!audioUrl) {
+    if (!directUrl) {
       throw new Error('Failed to get direct audio URL');
     }
     
-    console.log(`Got direct audio URL: ${audioUrl.substring(0, 30)}...`);
+    console.log(`Got direct audio URL: ${directUrl.substring(0, 30)}...`);
     
-    // Now use curl to download the file
-    const curlTempPath = path.join(tmpDir, `${videoId}_temp.webm`);
-    await execPromise(`curl -L -o "${curlTempPath}" "${audioUrl}"`);
+    // Download with curl or wget
+    const tempFile = path.join(tmpDir, `${videoId}_temp`);
+    try {
+      await execPromise(`curl -L "${directUrl}" -o "${tempFile}"`);
+    } catch (err) {
+      await execPromise(`wget "${directUrl}" -O "${tempFile}"`);
+    }
     
-    // Convert to mp3 if needed
-    await execPromise(`ffmpeg -i "${curlTempPath}" -vn -ar 44100 -ac 2 -b:a 192k "${outputPath}"`);
+    // Convert with ffmpeg
+    await execPromise(`ffmpeg -i "${tempFile}" -vn -ar 44100 -ac 2 -b:a 192k "${outputPath}"`);
     
     // Clean up temp file
-    if (fs.existsSync(curlTempPath)) {
-      fs.unlinkSync(curlTempPath);
+    if (fs.existsSync(tempFile)) {
+      fs.unlinkSync(tempFile);
     }
     
     if (fs.existsSync(outputPath)) {
-      const buffer = await fs.promises.readFile(outputPath);
+      console.log(`Strategy 4 succeeded. File size: ${fs.statSync(outputPath).size} bytes`);
+      const buffer = fs.readFileSync(outputPath);
       fs.unlinkSync(outputPath);
       return buffer;
     } else {
-      console.warn("Output file not found after strategy 5");
+      console.warn('Strategy 4: Output file not found');
     }
   } catch (err) {
-    console.warn('Strategy 5 failed:', err.message);
+    console.warn(`Strategy 4 failed: ${err.message}`);
   }
-
+  
+  // If we get here, all strategies failed
   throw new Error('All extraction strategies failed. Could not download audio from YouTube.');
 }
 
-// Define routes and start server
+/**
+ * Start the server and define routes
+ */
 async function startServer() {
-  // Ensure the yt-dlp binary is available before starting
-  await ensureYtDlpBinary();
-
+  // Ensure yt-dlp binary is available
+  const binaryReady = await ensureYtDlpBinary();
+  if (!binaryReady) {
+    console.warn('Warning: yt-dlp binary is not available. Audio extraction may fail.');
+  }
+  
   // Audio endpoint to stream audio files
   app.get('/audio/:videoId', async (req, res) => {
     const { videoId } = req.params;
@@ -444,15 +407,20 @@ async function startServer() {
       if (!buffer) {
         console.log(`Fetching audio for video ID: ${videoId}`);
         try {
-          // Extract audio using youtube-dl-exec
+          // Extract audio
           buffer = await extractAudio(videoId);
+          
+          // Verify the buffer is valid MP3 data
+          if (!buffer || buffer.length < 1000) {
+            throw new Error('Extracted audio file is too small or empty');
+          }
+          
+          // Cache the result
+          audioCache.set(cacheKey, buffer);
         } catch (error) {
           console.error('Audio extraction failed:', error.message);
           return res.status(500).send('Failed to extract audio: ' + error.message);
         }
-        
-        // Cache the result
-        audioCache.set(cacheKey, buffer);
       }
 
       const total = buffer.length;
@@ -489,89 +457,107 @@ async function startServer() {
   // Status endpoint to check if YouTube cookies are working
   app.get('/status', async (req, res) => {
     try {
-      const testUrl = 'https://www.youtube.com/watch?v=dQw4w9WgXcQ'; // A popular video
-      const result = await youtubedl.exec(testUrl, {
-        skipDownload: true,
-        f: true // List formats
-      });
+      // Try to get version info
+      const { stdout } = await execPromise(`"${ytdlpPath}" --version`);
       
       res.json({ 
         status: 'ok', 
-        message: 'YouTube API is accessible',
-        formats: result.stdout.split('\n').length - 1
+        binary: {
+          path: ytdlpPath,
+          exists: fs.existsSync(ytdlpPath),
+          version: stdout.trim()
+        },
+        environment: {
+          platform: process.platform,
+          nodejs: process.version
+        }
       });
     } catch (err) {
       res.status(500).json({ 
-        status: 'error', 
-        message: 'YouTube API is not accessible',
-        error: err.message 
-      });
-    }
-  });
-
-  // Cookie validation endpoint to check/update cookies
-  app.get('/validate-cookies', async (req, res) => {
-    if (!fs.existsSync(cookiesPath)) {
-      return res.status(404).json({
         status: 'error',
-        message: 'No cookies file found'
-      });
-    }
-    
-    try {
-      const stats = fs.statSync(cookiesPath);
-      const fileSize = stats.size;
-      const lastModified = stats.mtime;
-      
-      res.json({
-        status: 'ok',
-        cookiesPath: cookiesPath,
-        fileSize: `${fileSize} bytes`,
-        lastModified: lastModified,
-        message: 'Cookies file exists'
-      });
-    } catch (err) {
-      res.status(500).json({
-        status: 'error',
-        message: 'Error accessing cookies file',
-        error: err.message
+        message: 'Failed to execute yt-dlp',
+        error: err.message,
+        binaryPath: ytdlpPath,
+        binaryExists: fs.existsSync(ytdlpPath)
       });
     }
   });
 
-  // Add health check endpoint
-  app.get('/health', (_, res) => {
-    res.status(200).send('OK');
-  });
-
-  // Add a debugging endpoint to check binary paths
+  // Debug endpoint to get detailed information about the binary
   app.get('/debug', async (req, res) => {
     try {
+      // List bin directory contents
       const binFiles = fs.existsSync(BIN_DIR) ? fs.readdirSync(BIN_DIR) : [];
-      const ytdlpPath = path.join(BIN_DIR, process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
-      const ytdlpExists = fs.existsSync(ytdlpPath);
       
-      // Try to get version info
+      // Get binary info
       let versionInfo = "Unknown";
+      let binaryWorks = false;
       try {
         const { stdout } = await execPromise(`"${ytdlpPath}" --version`);
         versionInfo = stdout.trim();
+        binaryWorks = true;
       } catch (e) {
-        versionInfo = `Error getting version: ${e.message}`;
+        versionInfo = `Error: ${e.message}`;
+      }
+      
+      // Get environment info
+      const envInfo = {
+        NODE_ENV: process.env.NODE_ENV,
+        PATH: process.env.PATH ? process.env.PATH.split(':') : [],
+        PLATFORM: process.platform,
+        ARCH: process.arch,
+        NODE_VERSION: process.version
+      };
+      
+      // Test download
+      let downloadTest = "Not tested";
+      try {
+        const testUrl = 'https://www.youtube.com/watch?v=dQw4w9WgXcQ'; // Common test video
+        const command = `"${ytdlpPath}" "${testUrl}" --get-title`;
+        const { stdout } = await execPromise(command);
+        downloadTest = `Success: "${stdout.trim()}"`;
+      } catch (e) {
+        downloadTest = `Failed: ${e.message}`;
+      }
+      
+      // Get binary permissions
+      let permissions = "Unknown";
+      try {
+        const stats = fs.statSync(ytdlpPath);
+        permissions = `0${(stats.mode & parseInt('777', 8)).toString(8)}`;
+      } catch (e) {
+        permissions = `Error: ${e.message}`;
       }
       
       res.json({
-        platform: process.platform,
-        binDir: BIN_DIR,
-        binFiles,
-        ytdlpPath,
-        ytdlpExists,
-        ytdlpVersion: versionInfo,
-        tmpDir,
-        configDir,
-        configPath: configPath,
-        cookiesPath,
-        cookiesExist: fs.existsSync(cookiesPath)
+        binDir: {
+          path: BIN_DIR,
+          exists: fs.existsSync(BIN_DIR),
+          files: binFiles
+        },
+        ytdlpBinary: {
+          path: ytdlpPath,
+          exists: fs.existsSync(ytdlpPath),
+          permissions: permissions,
+          version: versionInfo,
+          works: binaryWorks,
+          downloadTest: downloadTest
+        },
+        environment: envInfo,
+        storage: {
+          tmpDir: {
+            path: tmpDir,
+            exists: fs.existsSync(tmpDir)
+          },
+          configDir: {
+            path: configDir,
+            exists: fs.existsSync(configDir)
+          },
+          cookiesFile: {
+            path: cookiesPath,
+            exists: fs.existsSync(cookiesPath)
+          }
+        }
       });
     } catch (err) {
       res.status(500).json({
@@ -581,13 +567,84 @@ async function startServer() {
       });
     }
   });
+  
+  // Test command execution endpoint
+  app.get('/test-command', async (req, res) => {
+    try {
+      // Try to run a simple command
+      const commands = [
+        {name: 'ls', cmd: 'ls -la /opt/render/project/src/'},
+        {name: 'echo', cmd: 'echo "Hello World"'},
+        {name: 'pwd', cmd: 'pwd'},
+        {name: 'yt-dlp', cmd: `"${ytdlpPath}" --version`}
+      ];
+      
+      const results = {};
+      
+      for (const cmd of commands) {
+        try {
+          const { stdout, stderr } = await execPromise(cmd.cmd);
+          results[cmd.name] = {
+            success: true,
+            stdout: stdout.trim(),
+            stderr: stderr ? stderr.trim() : ''
+          };
+        } catch (e) {
+          results[cmd.name] = {
+            success: false,
+            error: e.message
+          };
+        }
+      }
+      
+      res.json({
+        environment: {
+          uid: process.getuid?.() || 'unknown',
+          gid: process.getgid?.() || 'unknown',
+          cwd: process.cwd()
+        },
+        results
+      });
+    } catch (err) {
+      res.status(500).json({
+        status: 'error',
+        message: 'Command execution failed',
+        error: err.message
+      });
+    }
+  });
+  
+  // Simple health check endpoint
+  app.get('/health', (_, res) => {
+    res.status(200).send('OK');
+  });
+  
+  // Initiate download - admin endpoint
+  app.get('/admin/download-yt-dlp', async (req, res) => {
+    try {
+      const result = await downloadYtDlp();
+      res.json({
+        success: result,
+        message: result ? 'yt-dlp binary downloaded successfully' : 'Download failed',
+        path: ytdlpPath,
+        exists: fs.existsSync(ytdlpPath)
+      });
+    } catch (err) {
+      res.status(500).json({
+        status: 'error',
+        message: 'Failed to download binary',
+        error: err.message
+      });
+    }
+  });
 
+  // Start the server
   app.listen(PORT, () => {
     console.log(`🎧 Audio server running on port ${PORT}`);
   });
 }
 
-// Start the server with async/await
+// Start the server with error handling
 (async () => {
   try {
     await startServer();
